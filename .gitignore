@@ -1,0 +1,25 @@
+# Credentials
+.credentials
+*.json
+keypairs/
+
+# Build artifacts
+.zig-cache/
+zig-out/
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (dashboard)
+node_modules/
+.next/
+.env*.local
+
+# Logs
+*.log
