@@ -1,0 +1,261 @@
+# Vexor Project Rules
+# These rules apply ONLY to the /vexor/ directory and its contents.
+# Last updated: 2024-12-13
+
+## PROJECT IDENTITY
+
+**Name:** Vexor (Velox + Fulgor = Swift + Brilliance)
+**Type:** High-performance Solana validator client
+**Language:** Zig 0.13.0
+**Target:** Consumer-grade hardware (AMD Ryzen, 128GB RAM, NVMe SSD)
+**Goal:** 1M+ TPS, lightweight, automatic optimization
+
+## SCOPE BOUNDARIES
+
+### ✅ IN SCOPE - Files I should work with:
+- `/home/dbdev/solana-client-research/vexor/src/**/*.zig` - All source code
+- `/home/dbdev/solana-client-research/vexor/build.zig` - Build configuration
+- `/home/dbdev/solana-client-research/vexor/docs/*.md` - Documentation
+- `/home/dbdev/solana-client-research/vexor/tests/` - Test files
+- `/home/dbdev/solana-client-research/vexor/CHANGELOG.md` - Project history
+- `/home/dbdev/solana-client-research/vexor/README.md` - Project readme
+
+### ❌ OUT OF SCOPE - Files I should NOT touch:
+- Anything outside `/home/dbdev/solana-client-research/vexor/`
+- `/home/dbdev/` root files
+- Other projects in `/home/dbdev/solana-client-research/`
+- System files, SSH configs, etc.
+
+### ⚠️ PROTECTED - Requires explicit permission:
+- Validator keypairs (`*.json` in `/home/solana/.secrets/`)
+- Agave/Solana validator configuration
+- Production systemd services
+- Mainnet operations
+
+## MODULE ARCHITECTURE
+
+```
+src/
+├── main.zig              # Entry point, CLI parsing
+├── bench.zig             # Performance benchmarks
+├── core/                 # Types, config, allocators, keypair
+├── runtime/              # Bank, replay, bootstrap, transactions
+│   └── bpf/             # BPF VM for Solana programs
+├── network/              # Networking stack
+│   ├── af_xdp/          # Kernel bypass (AF_XDP)
+│   ├── quic/            # QUIC transport
+│   └── masque/          # MASQUE proxy protocol
+├── storage/              # Data persistence
+│   └── ramdisk/         # Tiered RAM disk storage
+├── consensus/            # Tower BFT, Alpenglow, PoH
+├── crypto/               # Ed25519, SHA256, BLS, GPU accel
+├── diagnostics/          # Health monitoring, audit logging
+├── optimizer/            # Hardware detection, system tuning
+├── rpc/                  # JSON-RPC server
+│   └── websocket/       # WebSocket subscriptions
+└── tools/                # Installer, switcher, alerts, backup
+```
+
+## CODING STANDARDS
+
+### Zig Conventions
+- Use `snake_case` for functions and variables
+- Use `PascalCase` for types and structs
+- Use `SCREAMING_SNAKE_CASE` for constants
+- Prefer explicit error handling over `catch unreachable`
+- Use `std.log` for logging, not `std.debug.print` in production code
+- Always handle memory allocation failures
+
+### File Organization
+- Each module has a `root.zig` that exports public API
+- Use `@import` for internal module access
+- Keep related functionality in the same file
+- Stub files (`*_stub.zig`) for optional features
+
+### Comments
+- Use `//!` for file-level documentation
+- Use `///` for function/type documentation
+- Use `// ═══...` style for section headers
+
+## BUILD SYSTEM
+
+### Build Commands
+```bash
+zig build                              # Debug build
+zig build -Doptimize=ReleaseFast       # Production build
+zig build -Doptimize=ReleaseFast -Daf_xdp=true  # With AF_XDP
+zig build test                         # Run tests
+zig build bench                        # Run benchmarks
+```
+
+### Feature Flags
+- `-Dgpu=true` - GPU acceleration (placeholder)
+- `-Daf_xdp=true` - AF_XDP kernel bypass networking
+- `-Dramdisk=true` - RAM disk tier-0 storage (default: true)
+- `-Dalpenglow=true` - Alpenglow consensus (experimental)
+- `-Dauto_optimize=true` - Auto-optimizer (default: true)
+- `-Dmasque=true` - MASQUE protocol for QUIC proxying
+
+### Output Binaries
+- `vexor` - Main validator binary
+- `vexor-install` - Unified installer/management tool
+- `vexor-optimize` - System optimization tool
+- `vexor-switch` - Client switcher (Vexor ↔ Agave)
+
+## VALIDATOR OPERATIONS
+
+### Test Validator
+- **IP:** 38.92.24.174
+- **User:** davidb (SSH), solana (runtime)
+- **Network:** Testnet
+- **Agave Service:** solana-validator.service
+- **Vexor Service:** vexor.service
+
+### Safe Operations (no permission needed)
+- `vexor-install status` - Check status
+- `vexor-install diagnose` - Run diagnostics
+- `vexor-install test-bootstrap` - Test snapshot loading
+- Building and testing locally
+
+### Dangerous Operations (ASK FIRST!)
+- `switch-to-vexor` - Stops Agave, starts Vexor
+- `switch-to-agave` - Stops Vexor, starts Agave
+- Any mainnet operations
+- Modifying keypairs or vote accounts
+
+## AFTER MAKING CHANGES
+
+### Always Update:
+1. **CHANGELOG.md** - Add entry for significant changes
+2. **Run build** - Ensure `zig build` succeeds
+3. **Test locally** - If possible, run affected tests
+
+### Before Deploying to Validator:
+1. Build with ReleaseFast: `zig build -Doptimize=ReleaseFast -Daf_xdp=true`
+2. SCP binaries to validator: `/tmp/`
+3. Install: `sudo cp /tmp/vexor* /opt/vexor/bin/`
+4. Set capabilities: `sudo setcap 'cap_net_raw,cap_net_admin,cap_sys_admin+eip' /opt/vexor/bin/vexor`
+5. Test: `vexor-install status`
+
+## KNOWN ISSUES & WORKAROUNDS
+
+### Current Limitations
+- `loadAppendVec` not fully implemented - accounts loading incomplete
+- Snapshot discovery via gossip not implemented - using manual download
+- Fast catchup (shred repair) not implemented
+
+### WSL Environment
+- Zig path: `$HOME/zig-linux-x86_64-0.13.0/zig`
+- May need: `export PATH="$HOME/zig-linux-x86_64-0.13.0:$PATH"`
+- SSH config: Must be `chmod 600 ~/.ssh/config`
+
+## MCP USAGE GUIDELINES (via MCPJungle Gateway)
+
+MCPJungle is deployed at **qstesting.com:8880** with 7 MCPs and 4 tool groups.
+**Memory MCP is included in ALL groups** for persistent context.
+
+### Tool Groups
+
+| Group | Endpoint | Tools | Use Case |
+|-------|----------|-------|----------|
+| **vexor-core** | `/v0/groups/vexor-core/mcp` | 23 | Daily Vexor/Solana/Zig coding |
+| **research** | `/v0/groups/research/mcp` | 20 | Documentation, web scraping, file exploration |
+| **thinking** | `/v0/groups/thinking/mcp` | 12 | Deep analysis, architecture design |
+| **full** | `/v0/groups/full/mcp` | 67 | All tools (use sparingly) |
+
+### CRITICAL: Memory MCP Protocol
+
+**Memory MCP maintains persistent context across sessions.** Follow this protocol:
+
+#### AT SESSION START
+```
+1. ALWAYS query memory first:
+   memory__search_nodes("CurrentSession") → Get current context
+   memory__search_nodes("Project:Vexor") → Get project state
+   
+2. Update CurrentSession with session start:
+   memory__add_observations("CurrentSession", ["Starting session on <date>", "Task: <user's request>"])
+```
+
+#### DURING WORK
+```
+- After fixing a bug:      memory__add_observations("Project:Vexor", ["Fixed: <description>"])
+- After design decision:   memory__create_entities + memory__add_observations
+- After learning something: memory__add_observations to relevant entity
+- When context is important: memory__create_relations to link concepts
+```
+
+#### AT SESSION END (or before context switch)
+```
+- memory__add_observations("CurrentSession", ["Completed: <what was done>", "Next: <pending work>"])
+```
+
+### Entity Types in Knowledge Graph
+
+| Entity Type | Examples | Use For |
+|-------------|----------|---------|
+| `Project` | Project:Vexor, Project:SnapStream | Main projects |
+| `Component` | SnapStream:Dashboard | Sub-components |
+| `Tool` | Tool:MCPJungle | Development tools |
+| `Infrastructure` | VPS:QSTesting | Servers/deployments |
+| `Reference` | External:Agave | External resources |
+| `Context` | CurrentSession | Session tracking |
+
+### Relation Types
+
+| Relation | Use For |
+|----------|---------|
+| `part_of` | Component → Project |
+| `uses` | Project → Tool |
+| `deployed_on` | Project → Infrastructure |
+| `references` | Project → Reference |
+| `working_on` | CurrentSession → Entity |
+| `depends_on` | Component → Component |
+
+### Priority Order (When Multiple Tools Could Work)
+
+1. **Memory MCP** - ALWAYS CHECK FIRST for existing context
+   - `memory__search_nodes` before asking questions
+   - `memory__read_graph` for full project context
+
+2. **Context7** - For documentation lookups
+   - Use: `resolve-library-id` → `get-library-docs`
+   - Why: Real-time docs prevent hallucinated APIs
+
+3. **Solana MCP** - For blockchain-specific questions
+   - Accounts, transactions, programs, RPC methods
+
+4. **Zig MCP** - For Zig language specifics
+   - Build system, std library, language features, code analysis
+
+5. **GitHub MCP** - Repository operations
+   - PRs, issues, file contents, commits
+
+6. **Firecrawl** - Only when other sources don't have the info
+   - Web scraping, search (more expensive)
+
+### MCP Best Practices
+
+1. **Always check Memory MCP first** - Don't re-ask what we already know
+2. **Store important findings** - Add observations to the knowledge graph
+3. **Use Context7 for version-specific docs** - Especially for Zig 0.13
+4. **Batch similar operations** - Multiple GitHub operations in sequence
+5. **Don't call MCPs unnecessarily** - If you know the answer, don't verify
+
+## COMMUNICATION STYLE
+
+When working on Vexor:
+- Focus on the specific task at hand
+- Don't over-engineer or add unnecessary features
+- Ask before making changes to validator operations
+- Update CHANGELOG.md after significant changes
+- Prefer fixing existing code over rewriting
+- Test changes before deploying
+- Use Context7 before Firecrawl for documentation
+
+## VERSION HISTORY
+
+See CHANGELOG.md for detailed history.
+
+Current version: 0.1.0-alpha
+
