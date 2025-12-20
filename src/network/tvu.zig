@@ -616,7 +616,7 @@ pub const TvuService = struct {
     /// Check for missing shreds and request repairs
     fn checkAndRequestRepairs(self: *Self) !void {
         // Check each slot in assembler for gaps
-        const slots = self.shred_assembler.getInProgressSlots();
+        const slots = self.shred_assembler.getInProgressSlots() catch return;
         
         for (slots) |slot| {
             const missing = self.shred_assembler.getMissingIndices(slot) catch continue;

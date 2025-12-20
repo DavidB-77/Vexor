@@ -475,6 +475,11 @@ pub const Runtime = struct {
             tvu.start() catch |err| {
                 std.log.warn("TVU start failed (non-fatal): {}", .{err});
             };
+            // Spawn dedicated TVU receive thread (processes packets + requests repairs)
+            _ = std.Thread.spawn(.{}, network.tvu.TvuService.run, .{tvu}) catch |err| {
+                std.log.warn("TVU thread spawn failed: {}", .{err});
+            };
+            std.log.info("TVU receive thread spawned", .{});
         }
 
         std.debug.print("[DEBUG] About to enter main loop, running={}\n", .{self.running.load(.seq_cst)});
