@@ -496,11 +496,18 @@ pub const GossipService = struct {
                 });
             },
             _ => {
-                std.debug.print("[Gossip] Unknown message type {} ({} bytes) from {}.{}.{}.{}:{}\n", .{
+                // Debug: Show first 16 bytes to diagnose the wire format issue
+                std.debug.print("[Gossip] Unknown type {} ({} bytes) from {}.{}.{}.{}:{}\n", .{
                     msg_type_raw, pkt.len,
                     pkt.src_addr.addr[0], pkt.src_addr.addr[1], pkt.src_addr.addr[2], pkt.src_addr.addr[3],
                     pkt.src_addr.port(),
                 });
+                std.debug.print("[Gossip] First 16 bytes: ", .{});
+                const debug_len = @min(16, pkt.len);
+                for (pkt.data[0..debug_len]) |b| {
+                    std.debug.print("{x:0>2} ", .{b});
+                }
+                std.debug.print("\n", .{});
             },
         }
     }

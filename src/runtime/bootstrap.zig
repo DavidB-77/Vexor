@@ -809,8 +809,8 @@ pub const VoteSubmitter = struct {
         // Vote for the current slot
         std.debug.print("[VoteSubmitter] Attempting vote for slot {d} (last_vote: {d})\n", .{current_slot, self.tower.last_vote_slot});
         
-        // Get blockhash for the transaction
-        const blockhash = self.fetchRecentBlockhash(current_slot);
+        // Get blockhash for the transaction (use local bank - no network call!)
+        const blockhash = self.getRecentBlockhash();
         
         // Create vote using the current slot
         const vote_result = try self.tower.vote(current_slot, blockhash);
@@ -821,9 +821,13 @@ pub const VoteSubmitter = struct {
         
         std.debug.print("[VoteSubmitter] Built TowerSync tx, size={d} bytes\n", .{vote_tx.len});
         
-        // Submit to TPU
+        // Submit to TPU (use sendVote for redundancy - sends to multiple leaders)
         if (self.tpu_client) |tpu| {
-            try tpu.sendTransaction(vote_tx, current_slot);
+            tpu.sendVote(vote_tx, current_slot) catch |err| {
+                std.debug.print("[VoteSubmitter] ⚠ Vote send error: {} (will retry)\n", .{err});
+                self.stats.votes_dropped += 1;
+                return err;
+            };
             self.stats.votes_submitted += 1;
             self.stats.last_vote_slot = current_slot;
             std.debug.print("[VoteSubmitter] ✓ Submitted vote for slot {d}\n", .{current_slot});
@@ -833,39 +837,38 @@ pub const VoteSubmitter = struct {
         }
     }
     
-    /// Cached blockhash and when it was fetched
-    var cached_blockhash: ?core.Hash = null;
-    var blockhash_fetch_slot: u64 = 0;
-    
-    /// Fetch recent blockhash from cluster RPC
-    fn fetchRecentBlockhash(self: *Self, current_slot: u64) core.Hash {
-        // Use cached blockhash if fresh (within 150 slots / ~1 minute)
-        if (cached_blockhash) |hash| {
-            if (current_slot < blockhash_fetch_slot + 100) {
-                return hash;
+    /// Get recent blockhash - prefer local bank, RPC fallback for bootstrap only.
+    /// VEXOR approach: Fast local access when possible, network only when necessary.
+    fn getRecentBlockhash(self: *Self) core.Hash {
+        // Primary: Use local bank's blockhash (fast, always fresh)
+        if (self.replay_stage.root_bank) |bank| {
+            // Use blockhash field (NOT bank_hash - those are different!)
+            if (!std.mem.eql(u8, &bank.blockhash.data, &core.Hash.ZERO.data)) {
+                return bank.blockhash;
+            }
+            // Bank exists but blockhash is zero - use bank_hash as fallback
+            if (!std.mem.eql(u8, &bank.bank_hash.data, &core.Hash.ZERO.data)) {
+                std.debug.print("[VoteSubmitter] Using bank_hash (blockhash not yet set)\n", .{});
+                return bank.bank_hash;
             }
         }
         
-        // Fetch new blockhash from RPC
-        const new_hash = self.fetchBlockhashFromRpc() catch |err| {
-            std.debug.print("[VoteSubmitter] RPC blockhash fetch failed: {}, using fallback\n", .{err});
-            // Fallback to bank hash or placeholder
-            if (self.replay_stage.root_bank) |bank| {
-                return bank.bank_hash;
-            }
+        // Bootstrap fallback: Bank not ready yet, fetch from RPC
+        std.debug.print("[VoteSubmitter] Bootstrap mode - fetching blockhash from RPC\n", .{});
+        return self.fetchBlockhashFromRpc() catch |err| {
+            std.debug.print("[VoteSubmitter] RPC blockhash fetch failed: {}\n", .{err});
+            // Last resort: return a deterministic hash based on current time
+            // This allows voting to proceed even if RPC fails during bootstrap
             var hash: core.Hash = undefined;
-            std.mem.writeInt(u64, hash.data[0..8], current_slot, .little);
-            @memset(hash.data[8..], 0xAB);
+            const ts: u64 = @intCast(std.time.milliTimestamp());
+            std.mem.writeInt(u64, hash.data[0..8], ts, .little);
+            @memset(hash.data[8..], 0xBB); // Bootstrap marker
             return hash;
         };
-        
-        cached_blockhash = new_hash;
-        blockhash_fetch_slot = current_slot;
-        std.debug.print("[VoteSubmitter] Fetched fresh blockhash from RPC\n", .{});
-        return new_hash;
     }
     
-    /// Actually fetch blockhash via HTTP
+    /// Bootstrap-only: Fetch blockhash via RPC when local bank not available.
+    /// This is only used during early bootstrap before bank is initialized.
     fn fetchBlockhashFromRpc(self: *Self) !core.Hash {
         const http = std.http;
         
@@ -894,29 +897,22 @@ pub const VoteSubmitter = struct {
         const len = req.reader().readAll(&response_buf) catch return error.ReadFailed;
         const response = response_buf[0..len];
         
-        // Debug: print first 200 chars of response
-        const preview_len = @min(len, 200);
-        std.debug.print("[VoteSubmitter] RPC response ({d} bytes): {s}\n", .{len, response[0..preview_len]});
-        
         // Parse: "blockhash":"<44-char base58>"
         const needle = "\"blockhash\":\"";
-        const pos = std.mem.indexOf(u8, response, needle) orelse {
-            std.debug.print("[VoteSubmitter] 'blockhash' not found in response!\n", .{});
-            return error.ParseFailed;
-        };
+        const pos = std.mem.indexOf(u8, response, needle) orelse return error.ParseFailed;
         const hash_start = pos + needle.len;
         const hash_end = std.mem.indexOfPos(u8, response, hash_start, "\"") orelse return error.ParseFailed;
         const hash_b58 = response[hash_start..hash_end];
         
-        // Decode base58 to 32 bytes
         return decodeBase58Hash(hash_b58);
     }
     
-    /// Decode base58 string to 32-byte hash
+    /// Decode base58 string to 32-byte hash (used for RPC blockhash parsing)
     fn decodeBase58Hash(b58: []const u8) !core.Hash {
         const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
         
         var bytes: [32]u8 = undefined;
+        @memset(&bytes, 0);
         var bytes_len: usize = 0;
         
         for (b58) |c| {
@@ -935,19 +931,6 @@ pub const VoteSubmitter = struct {
                 if (idx >= bytes_len and carry == 0) break;
             }
             bytes_len = @max(bytes_len, idx);
-        }
-        
-        // Handle leading '1's
-        var leading_ones: usize = 0;
-        for (b58) |c| {
-            if (c != '1') break;
-            leading_ones += 1;
-        }
-        
-        // Zero-fill leading bytes
-        const data_start = 32 - bytes_len;
-        if (data_start > leading_ones) {
-            @memset(bytes[0..data_start], 0);
         }
         
         return core.Hash{ .data = bytes };

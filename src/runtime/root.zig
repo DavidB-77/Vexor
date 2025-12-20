@@ -415,8 +415,10 @@ pub const Runtime = struct {
                 self.tpu_client.?.setGossipService(gs);
             }
             
-            // Connect TPU client to replay stage
+            // Connect to leader schedule for slot->leader lookup
+            // This is CRITICAL for vote submission - we need to know where to send votes!
             if (self.replay_stage) |rs| {
+                self.tpu_client.?.setLeaderSchedule(&rs.leader_cache);
                 rs.setTpuClient(self.tpu_client.?);
             }
             

@@ -11,6 +11,7 @@ const std = @import("std");
 const core = @import("../core/root.zig");
 const packet = @import("packet.zig");
 const gossip = @import("gossip.zig");
+const consensus = @import("../consensus/root.zig");
 
 /// TPU port offset from gossip port (Solana convention)
 pub const TPU_PORT_OFFSET: u16 = 6;
@@ -39,6 +40,9 @@ pub const TpuClient = struct {
 
     /// Reference to gossip service for peer discovery
     gossip_service: ?*gossip.GossipService,
+
+    /// Reference to leader schedule for slot->leader lookup
+    leader_schedule: ?*consensus.leader_schedule.LeaderScheduleCache,
 
     /// Leader TPU addresses (slot -> address)
     leader_tpu_cache: std.AutoHashMap(core.Slot, packet.SocketAddr),
@@ -87,6 +91,7 @@ pub const TpuClient = struct {
             .allocator = allocator,
             .udp_socket = sock,
             .gossip_service = null,
+            .leader_schedule = null,
             .leader_tpu_cache = std.AutoHashMap(core.Slot, packet.SocketAddr).init(allocator),
             .pending_txs = std.ArrayList(PendingTx).init(allocator),
             .stats = TpuStats{},
@@ -114,6 +119,11 @@ pub const TpuClient = struct {
         self.gossip_service = gossip_svc;
     }
 
+    /// Set leader schedule reference for slot->leader lookup
+    pub fn setLeaderSchedule(self: *Self, schedule: *consensus.leader_schedule.LeaderScheduleCache) void {
+        self.leader_schedule = schedule;
+    }
+
     /// Update leader TPU address for a slot
     pub fn updateLeaderTpu(self: *Self, slot: core.Slot, addr: packet.SocketAddr) !void {
         try self.leader_tpu_cache.put(slot, addr);
@@ -126,15 +136,40 @@ pub const TpuClient = struct {
             return addr;
         }
 
-        // Try to get from gossip
+        // Try to look up leader TPU from gossip + leader schedule
+        const leader_pubkey = self.getLeaderPubkey(slot) orelse {
+            return null;
+        };
+        
         if (self.gossip_service) |gs| {
-            // Look up leader's contact info
-            // The leader schedule would give us the leader pubkey,
-            // then we look up their TPU address from gossip
-            _ = gs;
-            // TODO: Implement leader lookup from gossip
+            // Look up leader's contact info from gossip table
+            if (gs.table.getContact(leader_pubkey)) |contact| {
+                // Validate address before using
+                if (contact.tpu_addr.port() == 0) {
+                    return null;
+                }
+                // Cache the result for future lookups
+                self.leader_tpu_cache.put(slot, contact.tpu_addr) catch {};
+                std.debug.print("[TpuClient] Found leader TPU for slot {d}: {d}.{d}.{d}.{d}:{d}\n", .{
+                    slot,
+                    contact.tpu_addr.addr[0], contact.tpu_addr.addr[1],
+                    contact.tpu_addr.addr[2], contact.tpu_addr.addr[3],
+                    contact.tpu_addr.port(),
+                });
+                return contact.tpu_addr;
+            }
         }
 
+        return null;
+    }
+    
+    /// Get leader pubkey for a slot from leader schedule
+    fn getLeaderPubkey(self: *Self, slot: core.Slot) ?core.Pubkey {
+        if (self.leader_schedule) |schedule| {
+            if (schedule.getSlotLeader(slot)) |leader_bytes| {
+                return core.Pubkey{ .data = leader_bytes };
+            }
+        }
         return null;
     }
 
@@ -243,29 +278,31 @@ pub const TpuClient = struct {
     }
 
     /// Send a vote transaction (high priority)
+    /// VEXOR approach: Send to current + next leader for efficient redundancy.
+    /// This balances reliability with lightweight network overhead.
     pub fn sendVote(self: *Self, vote_tx: []const u8, target_slot: core.Slot) !void {
-        // Votes are high priority - try multiple leaders
+        // Send to current leader + next leader for redundancy
+        // VEXOR philosophy: Efficient redundancy (2 leaders) vs heavyweight (4 leaders)
         const slots_to_try = [_]core.Slot{
             target_slot,
             target_slot + 1,
-            target_slot + 2,
-            target_slot + 3,
         };
 
-        var sent = false;
+        var sent_count: u32 = 0;
         for (slots_to_try) |slot| {
             if (self.getLeaderTpu(slot)) |addr| {
                 self.sendUdp(vote_tx, addr) catch continue;
-                sent = true;
-                break;
+                sent_count += 1;
             }
         }
 
-        if (!sent) {
-            // Queue for later
+        if (sent_count == 0) {
+            // No leaders found - queue for later retry
             try self.queueTransaction(vote_tx, target_slot);
+            std.debug.print("[TpuClient] Vote queued - no leaders found for slot {d}\n", .{target_slot});
         } else {
-            self.stats.txs_sent_udp += 1;
+            self.stats.txs_sent_udp += sent_count;
+            std.debug.print("[TpuClient] Vote sent to {d} leader(s) for slot {d}\n", .{ sent_count, target_slot });
         }
     }
 };
