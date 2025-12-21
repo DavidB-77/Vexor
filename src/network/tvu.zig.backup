@@ -104,8 +104,8 @@ pub const TvuService = struct {
         /// Network interface for AF_XDP (empty = auto-detect)
         interface: []const u8 = "",
 
-        /// Validator keypair (for signing repair requests)
-        keypair: ?*const core.Keypair = null,
+        /// Validator identity (32-byte pubkey for repair requests)
+        identity: [32]u8 = [_]u8{0} ** 32,
     };
 
     pub const Stats = struct {
@@ -193,7 +193,7 @@ pub const TvuService = struct {
 
         // Try AF_XDP acceleration first (kernel bypass - 10x faster)
         if (self.config.enable_af_xdp) {
-            if (false and self.tryStartAcceleratedIO()) {
+            if (self.tryStartAcceleratedIO()) {
                 self.using_accelerated_io = true;
                 self.running.store(true, .seq_cst);
                 std.debug.print(
@@ -422,11 +422,6 @@ pub const TvuService = struct {
 
     /// Process a single shred packet
     fn processShred(self: *Self, pkt: *const packet.Packet) ShredResult {
-        // DEBUG: Log every packet received
-        const pkt_count = self.stats.shreds_received.load(.monotonic);
-        if (@mod(pkt_count, 50) == 0) {
-            std.log.info("[TVU] Packet #{d} len={d} first4: {x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ pkt_count, pkt.len, pkt.data[0], pkt.data[1], pkt.data[2], pkt.data[3] });
-        }
         const count = self.stats.shreds_received.fetchAdd(1, .monotonic);
 
         // Parse shred
@@ -519,60 +514,49 @@ pub const TvuService = struct {
     }
 
     /// Request repairs for missing shreds
-    /// Request repairs using modern signed format (Firedancer-compatible)
-    /// Format: [type:4][signature:64][sender:32][recipient:32][timestamp:8][nonce:4][slot:8][shred_idx:8] = 160 bytes
     pub fn requestRepairs(self: *Self, slot: core.Slot, missing_indices: []const u32) !void {
         if (self.repair_socket == null) return;
-        const keypair = self.config.keypair orelse return;
+        
+        // Get repair peers from gossip
         const repair_peers = self.getRepairPeers(slot);
         if (repair_peers.len == 0) return;
-        const timestamp_ms: u64 = @intCast(std.time.milliTimestamp());
-        const nonce: u32 = @truncate(timestamp_ms);
+
         for (missing_indices) |shred_idx| {
+            var pkt = packet.Packet.init();
+
+            // Build repair request (WindowIndex format)
+            // Format: [type: u8] [slot: u64] [shred_index: u64] [nonce: u32] [from: 32]
+            pkt.data[0] = 0x00; // WindowIndex repair type
+            std.mem.writeInt(u64, pkt.data[1..9], slot, .little);
+            std.mem.writeInt(u64, pkt.data[9..17], shred_idx, .little);
+            std.mem.writeInt(u32, pkt.data[17..21], @intCast(@as(u32, @truncate(@as(u64, @intCast(std.time.timestamp()))))), .little);
+            @memcpy(pkt.data[21..53], &self.config.identity);
+            pkt.len = 53;
+
+            // Send to repair peers (try 3 peers for redundancy)
             for (repair_peers[0..@min(3, repair_peers.len)]) |peer| {
-                var pkt = packet.Packet.init();
-                // Message type: 8 = REPAIR_WINDOW_INDEX (4 bytes LE)
-                std.mem.writeInt(u32, pkt.data[0..4], 8, .little);
-                // Sender pubkey (bytes 68-99)
-                @memcpy(pkt.data[68..100], &keypair.public.data);
-                // Recipient pubkey (bytes 100-131)
-                @memcpy(pkt.data[100..132], &peer.pubkey);
-                // Timestamp in ms (bytes 132-139)
-                std.mem.writeInt(u64, pkt.data[132..140], timestamp_ms, .little);
-                // Nonce (bytes 140-143)
-                std.mem.writeInt(u32, pkt.data[140..144], nonce, .little);
-                // Slot (bytes 144-151)
-                std.mem.writeInt(u64, pkt.data[144..152], slot, .little);
-                // Shred index (bytes 152-159)
-                std.mem.writeInt(u64, pkt.data[152..160], shred_idx, .little);
-                // Sign bytes 68-159 (everything after signature)
-                const signature = keypair.sign(pkt.data[68..160]);
-                @memcpy(pkt.data[4..68], &signature.data);
-                pkt.len = 160;
-                pkt.src_addr = peer.addr;
+                pkt.src_addr = peer;
                 _ = self.repair_socket.?.send(&pkt) catch continue;
                 _ = self.stats.repairs_sent.fetchAdd(1, .monotonic);
             }
+            
+            // Log first request per batch
             if (shred_idx == missing_indices[0]) {
-                std.debug.print("[REPAIR] Signed request for slot {d} idx {d} to {d} peers\n", .{
+                std.debug.print("[REPAIR] Sending request for slot {d} idx {d} to {d} peers\n", .{
                     slot, shred_idx, @min(3, repair_peers.len),
                 });
             }
         }
     }
-    /// Repair peer info (address + pubkey for signed requests)
-    const RepairPeer = struct {
-        addr: packet.SocketAddr,
-        pubkey: [32]u8,
-    };
+    
     /// Get repair peers for a slot (nodes that likely have it)
     /// Queries gossip for peers with valid serve_repair addresses
-    fn getRepairPeers(self: *Self, slot: core.Slot) []const RepairPeer {
+    fn getRepairPeers(self: *Self, slot: core.Slot) []const packet.SocketAddr {
         _ = slot;
         
         // Static buffer to hold discovered repair peers (persists across calls)
         const S = struct {
-            var repair_peers: [5]RepairPeer = undefined;
+            var repair_peers: [5]packet.SocketAddr = undefined;
             var peer_count: usize = 0;
         };
         
@@ -584,7 +568,7 @@ pub const TvuService = struct {
                 const info = entry.value_ptr;
                 // Check if peer has a valid serve_repair address (port > 0)
                 if (info.serve_repair_addr.port() > 0) {
-                    S.repair_peers[S.peer_count] = .{ .addr = info.serve_repair_addr, .pubkey = info.pubkey.data };
+                    S.repair_peers[S.peer_count] = info.serve_repair_addr;
                     S.peer_count += 1;
                     if (S.peer_count >= 5) break;
                 }
@@ -598,17 +582,16 @@ pub const TvuService = struct {
         
         // Fallback: hardcoded testnet repair peers
         std.debug.print("[REPAIR] Using fallback hardcoded peers (gossip had 0)\n", .{});
-        const static_repair_peers = &[_]RepairPeer{
-            .{ .addr = packet.SocketAddr.ipv4(.{ 192, 155, 103, 41 }, 8013), .pubkey = [_]u8{0} ** 32 },
-            .{ .addr = packet.SocketAddr.ipv4(.{ 104, 250, 133, 50 }, 8012), .pubkey = [_]u8{0} ** 32 },
-            .{ .addr = packet.SocketAddr.ipv4(.{ 147, 28, 169, 89 }, 8013), .pubkey = [_]u8{0} ** 32 },
+        const static_repair_peers = &[_]packet.SocketAddr{
+            packet.SocketAddr.ipv4(.{ 192, 155, 103, 41 }, 8013),
+            packet.SocketAddr.ipv4(.{ 104, 250, 133, 50 }, 8012),
+            packet.SocketAddr.ipv4(.{ 147, 28, 169, 89 }, 8013),
         };
         return static_repair_peers;
     }
     
     /// Run the TVU receive loop (call from dedicated thread)
     pub fn run(self: *Self) void {
-        std.debug.print("[TVU-THREAD] run() called, starting...\n", .{});
         self.running.store(true, .release);
         
         std.log.info("[TVU] Starting receive loop on port {}", .{self.tvu_port});

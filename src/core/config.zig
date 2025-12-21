@@ -34,9 +34,9 @@ pub const Config = struct {
     // ═══════════════════════════════════════════════════════════════════════
     rpc_port: u16 = 8899,
     rpc_bind_address: []const u8 = "0.0.0.0",
-    gossip_port: u16 = 8001,
+    gossip_port: u16 = 8000,
     tpu_port: u16 = 8003,
-    tvu_port: u16 = 8004,
+    tvu_port: u16 = 8001,
     repair_port: u16 = 8005,
     dynamic_port_range: PortRange = .{ .start = 8100, .end = 8200 },
     entrypoints: []const []const u8 = &.{},
@@ -335,7 +335,7 @@ test "config defaults" {
     defer config.deinit();
 
     try std.testing.expectEqual(@as(u16, 8899), config.rpc_port);
-    try std.testing.expectEqual(@as(u16, 8001), config.gossip_port);
+    try std.testing.expectEqual(@as(u16, 8000), config.gossip_port);
     try std.testing.expectEqual(Config.Cluster.mainnet_beta, config.cluster);
 }
 

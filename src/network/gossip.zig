@@ -305,7 +305,7 @@ pub const GossipService = struct {
 
     pub const Config = struct {
         /// Gossip port to bind
-        gossip_port: u16 = 8001,
+        gossip_port: u16 = 8000,
 
         /// How often to pull from peers (ms)
         pull_interval_ms: u64 = 15_000,
@@ -326,7 +326,7 @@ pub const GossipService = struct {
         tpu_port: u16 = 8004,
         
         /// TVU port
-        tvu_port: u16 = 8002,
+        tvu_port: u16 = 8001,
         
         /// Repair port
         repair_port: u16 = 8003,
@@ -914,6 +914,7 @@ pub const GossipService = struct {
                     1 => info.tvu_addr = addr,
                     3 => info.repair_addr = addr,
                     4 => info.tpu_addr = addr,
+                    9 => info.serve_repair_addr = addr,
                     7 => info.rpc_addr = addr,
                     else => {},
                 }
@@ -1139,7 +1140,7 @@ pub const GossipService = struct {
                 
                 switch (tag) {
                     0 => info.gossip_addr = addr,      // gossip
-                    1 => info.repair_addr = addr,     // repair
+                    4 => info.serve_repair_addr = addr, // serve_repair
                     2 => info.rpc_addr = addr,         // rpc
                     5 => info.tpu_addr = addr,         // tpu
                     10 => info.tvu_addr = addr,        // tvu

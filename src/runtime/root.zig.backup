@@ -220,7 +220,7 @@ pub const Runtime = struct {
             .repair_port = self.config.repair_port,
             .enable_af_xdp = self.config.enable_af_xdp,
             .interface = self.config.interface,
-            .keypair = if (self.identity) |*kp| kp else null,
+            .identity = self.identity.?.public.data,
         });
         
         // Connect TVU to gossip for repair peer discovery
@@ -396,7 +396,7 @@ pub const Runtime = struct {
             .repair_port = self.config.repair_port,
             .enable_af_xdp = self.config.enable_af_xdp,
             .interface = self.config.interface,
-            .keypair = if (self.identity) |*kp| kp else null,
+            .identity = self.identity.?.public.data,
         });
         
         // Connect TVU to gossip for repair peer discovery
@@ -519,28 +519,16 @@ pub const Runtime = struct {
                     self.onSlotCompleted(slot) catch {};
                 }
                 
-                // Sync current slot from network (query RPC if no shreds received yet)
-                var network_max = tvu.stats.max_slot_seen.load(.monotonic);
+                // Sync current slot from network max slot (even if we haven't completed slots)
+                const network_max = tvu.stats.max_slot_seen.load(.monotonic);
                 const current = self.current_slot.load(.seq_cst);
-                
-                // If no shreds received yet, fetch network slot via RPC periodically
-                if (network_max == 0 and @mod(loop_count, 100000) == 1) {
-                    if (self.fetchNetworkSlot()) |rpc_slot| {
-                        network_max = rpc_slot;
-                        tvu.stats.max_slot_seen.store(rpc_slot, .monotonic);
-                        std.debug.print("[SYNC] Network slot from RPC: {d} (local: {d})\n", .{rpc_slot, current});
-                    }
+                if (network_max > current + 10) { // Only sync if we're significantly behind
+                    // Jump to catch up - we'll request repairs from here
+                    self.current_slot.store(network_max - 10, .seq_cst);
                 }
                 
-                // Jump to near network tip if significantly behind
-                if (network_max > current + 100) {
-                    const new_slot = network_max - 50;
-                    self.current_slot.store(new_slot, .seq_cst);
-                    std.debug.print("[SYNC] Jumped to slot {d} (network: {d})\n", .{new_slot, network_max});
-                }
-                
-                // Request repairs more frequently during catch-up
-                if (@mod(loop_count, 10000) == 0) {
+                // Proactively request repairs for catch-up (every 5 seconds)
+                if (@mod(loop_count, 50000) == 0) {
                     self.requestCatchUpRepairs(tvu);
                 }
             }
@@ -592,34 +580,6 @@ pub const Runtime = struct {
     }
     
     /// Request repairs for catch-up (used when behind the network)
-    /// Fetch current network slot via RPC (for bootstrap catch-up)
-    fn fetchNetworkSlot(self: *Self) ?u64 {
-        _ = self;
-        const result = std.process.Child.run(.{
-            .allocator = std.heap.page_allocator,
-            .argv = &[_][]const u8{
-                "curl", "-s", "--max-time", "3",
-                "https://api.testnet.solana.com",
-                "-X", "POST",
-                "-H", "Content-Type: application/json",
-                "-d", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSlot\"}",
-            },
-        }) catch return null;
-        defer std.heap.page_allocator.free(result.stdout);
-        defer std.heap.page_allocator.free(result.stderr);
-        
-        // Parse "result":NNNNNN from JSON
-        const response = result.stdout;
-        if (std.mem.indexOf(u8, response, "\"result\":")) |idx| {
-            const num_start = idx + 9;
-            var end = num_start;
-            while (end < response.len and response[end] >= '0' and response[end] <= '9') : (end += 1) {}
-            if (end > num_start) {
-                return std.fmt.parseInt(u64, response[num_start..end], 10) catch null;
-            }
-        }
-        return null;
-    }
     fn requestCatchUpRepairs(self: *Self, tvu: *network.tvu.TvuService) void {
         const current_slot = self.current_slot.load(.seq_cst);
         
