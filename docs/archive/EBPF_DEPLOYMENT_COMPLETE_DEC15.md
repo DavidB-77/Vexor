@@ -82,7 +82,7 @@ Using userspace port filtering (~10M pps)
 
 Stored in `.credentials` (gitignored):
 - User: `davidb`
-- Password: `Snapshot26*=`
+- Password: `<REMOVED>`
 - Host: `38.92.24.174`
 
 ## Files Deployed

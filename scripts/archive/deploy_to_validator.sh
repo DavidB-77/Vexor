@@ -12,7 +12,7 @@ fi
 
 VALIDATOR_HOST="${1:-${VALIDATOR_HOST:-38.92.24.174}}"
 VALIDATOR_USER="${VALIDATOR_USER:-davidb}"
-VALIDATOR_PASSWORD="${VALIDATOR_PASSWORD:-Snapshot26*=}"
+VALIDATOR_PASSWORD="${VALIDATOR_PASSWORD:-<REMOVED>}"
 REMOTE_DIR="/home/davidb/bin/vexor"
 REMOTE_PATH="/home/davidb/bin/vexor/vexor"
 REMOTE_BPF_PATH="/home/davidb/bin/vexor/bpf"

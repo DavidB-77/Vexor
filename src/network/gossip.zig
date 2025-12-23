@@ -44,6 +44,9 @@ pub const ContactInfo = struct {
     /// TPU forward address
     tpu_fwd_addr: packet.SocketAddr,
 
+    /// TPU vote address (dedicated port for vote transactions)
+    tpu_vote_addr: packet.SocketAddr,
+
     /// TVU address (for shreds)
     tvu_addr: packet.SocketAddr,
 
@@ -95,6 +98,7 @@ pub const ContactInfo = struct {
             .gossip_addr = packet.SocketAddr.ipv4(ip, gossip_port),
             .tpu_addr = packet.SocketAddr.ipv4(ip, tpu_port),
             .tpu_fwd_addr = packet.SocketAddr.ipv4(ip, tpu_port + 1),
+            .tpu_vote_addr = packet.SocketAddr.ipv4(ip, tpu_port + 2),  // TPU vote port
             .tvu_addr = packet.SocketAddr.ipv4(ip, tvu_port),
             .tvu_fwd_addr = packet.SocketAddr.ipv4(ip, tvu_port + 1),
             .repair_addr = packet.SocketAddr.ipv4(ip, repair_port),
@@ -879,6 +883,7 @@ pub const GossipService = struct {
             .gossip_addr = packet.SocketAddr.UNSPECIFIED,
             .tpu_addr = packet.SocketAddr.UNSPECIFIED,
             .tpu_fwd_addr = packet.SocketAddr.UNSPECIFIED,
+            .tpu_vote_addr = packet.SocketAddr.UNSPECIFIED,
             .tvu_addr = packet.SocketAddr.UNSPECIFIED,
             .tvu_fwd_addr = packet.SocketAddr.UNSPECIFIED,
             .repair_addr = packet.SocketAddr.UNSPECIFIED,
@@ -893,8 +898,8 @@ pub const GossipService = struct {
         
         var offset: usize = 32;
         
-        // Parse sockets: gossip, tvu, tvu_forwards, repair, tpu, ...
-        // Each socket: [family(4)] + [ip(4 or 16)] + [port(2)]
+        // Parse sockets in LegacyContactInfo order:
+        // 0=gossip, 1=tvu, 2=tvu_fwd, 3=repair, 4=tpu, 5=tpu_fwd, 6=tpu_vote, 7=rpc, 8=rpc_pubsub, 9=serve_repair
         inline for (0..10) |i| {
             if (offset + 6 > data.len) return null;
             const family = std.mem.readInt(u32, data[offset..][0..4], .little);
@@ -914,8 +919,9 @@ pub const GossipService = struct {
                     1 => info.tvu_addr = addr,
                     3 => info.repair_addr = addr,
                     4 => info.tpu_addr = addr,
-                    9 => info.serve_repair_addr = addr,
+                    6 => info.tpu_vote_addr = addr,  // TPU vote port
                     7 => info.rpc_addr = addr,
+                    9 => info.serve_repair_addr = addr,
                     else => {},
                 }
             } else {
@@ -956,6 +962,7 @@ pub const GossipService = struct {
             .gossip_addr = packet.SocketAddr.UNSPECIFIED,
             .tpu_addr = packet.SocketAddr.UNSPECIFIED,
             .tpu_fwd_addr = packet.SocketAddr.UNSPECIFIED,
+            .tpu_vote_addr = packet.SocketAddr.UNSPECIFIED,
             .tvu_addr = packet.SocketAddr.UNSPECIFIED,
             .tvu_fwd_addr = packet.SocketAddr.UNSPECIFIED,
             .repair_addr = packet.SocketAddr.UNSPECIFIED,
@@ -1055,7 +1062,8 @@ pub const GossipService = struct {
         // Firedancer fd_gossip_msg_parse.c:476-489
         var addresses: [16][4]u8 = undefined;
         var addr_idx: u16 = 0;
-        while (addr_idx < addr_count and offset + 8 <= data.len) : (addr_idx += 1) {
+        // Parse up to 16 addresses (array size limit)
+        while (addr_idx < addr_count and addr_idx < 16 and offset + 8 <= data.len) : (addr_idx += 1) {
             const is_ip6 = std.mem.readInt(u32, data[offset..][0..4], .little);
             offset += 4;
             if (is_ip6 == 0) {
@@ -1068,6 +1076,8 @@ pub const GossipService = struct {
                 addresses[@intCast(addr_idx)] = .{ 0, 0, 0, 0 }; // Mark as null
             }
         }
+        // Track actual addresses parsed (may be less than addr_count)
+        const actual_addr_count = addr_idx;
         
         // 7. Socket entries: [count(compact_u16)] + [entries...]
         // Firedancer uses compact_u16, NOT regular varint! (fd_gossip_msg_parse.c:499)
@@ -1130,20 +1140,29 @@ pub const GossipService = struct {
             }
             offset += port_offset_bytes;
             
-            // Ports are cumulative offsets (Firedancer fd_gossip_msg_parse.c:514)
+            // Ports are cumulative offsets - ALWAYS accumulate (Firedancer fd_gossip_msg_parse.c:514)
+            // This must happen BEFORE validity check, as Sig does in buildCache()
             cur_port = @as(u16, @intCast(@as(u32, cur_port) + @as(u32, port_offset)));
             
             // Map socket tag to ContactInfo field (Firedancer fd_gossip_msg_parse.c:519-523)
-            if (addr_index < addr_count and addresses[addr_index][0] != 0) {
+            // Use actual_addr_count (addresses actually parsed) not addr_count (declared in wire format)
+            // Also bounds check against array size (16) to prevent out-of-bounds access
+            if (addr_index < actual_addr_count and addr_index < 16 and addresses[addr_index][0] != 0) {
                 const ip = addresses[addr_index];
                 const addr = packet.SocketAddr.ipv4(ip, cur_port);
                 
+                // Modern SocketTag values from Sig:
+                // 0=gossip, 1=repair, 2=rpc, 3=rpc_pubsub, 4=serve_repair,
+                // 5=tpu, 6=tpu_forwards, 7=tpu_forwards_quic, 8=tpu_quic,
+                // 9=tpu_vote, 10=turbine_recv (tvu), 11=turbine_recv_quic
                 switch (tag) {
-                    0 => info.gossip_addr = addr,      // gossip
+                    0 => info.gossip_addr = addr,       // gossip
+                    1 => info.repair_addr = addr,       // repair
+                    2 => info.rpc_addr = addr,          // rpc
                     4 => info.serve_repair_addr = addr, // serve_repair
-                    2 => info.rpc_addr = addr,         // rpc
-                    5 => info.tpu_addr = addr,         // tpu
-                    10 => info.tvu_addr = addr,        // tvu
+                    5 => info.tpu_addr = addr,          // tpu
+                    9 => info.tpu_vote_addr = addr,     // tpu_vote
+                    10 => info.tvu_addr = addr,         // turbine_recv (tvu)
                     else => {},
                 }
             }

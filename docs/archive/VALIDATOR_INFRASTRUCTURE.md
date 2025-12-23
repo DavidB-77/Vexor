@@ -67,7 +67,7 @@ ssh davidb@38.92.24.174 -i ~/.ssh/snapstream_wsl -J qstesting
 ssh validator-solana
 ```
 - **Users:** `davidb`, `solana`
-- **Sudo Password:** `Snapshot26*=`
+- **Sudo Password:** `<REMOVED>`
 - **SSH Key:** `~/.ssh/snapstream_wsl` or `~/.ssh/id_davidb_validator`
 
 ### Validator 2 (Secondary)

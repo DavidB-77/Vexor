@@ -144,19 +144,57 @@ pub const TpuClient = struct {
         if (self.gossip_service) |gs| {
             // Look up leader's contact info from gossip table
             if (gs.table.getContact(leader_pubkey)) |contact| {
+                // Prefer tpu_vote_addr for vote transactions (dedicated vote port)
+                // Fall back to regular tpu_addr if vote port not available
+                const vote_addr = if (contact.tpu_vote_addr.port() != 0)
+                    contact.tpu_vote_addr
+                else
+                    contact.tpu_addr;
+                
                 // Validate address before using
-                if (contact.tpu_addr.port() == 0) {
+                if (vote_addr.port() == 0) {
+                    std.debug.print("[TpuClient] Leader found but has no valid port! tpu_vote={d}, tpu={d}\n", .{
+                        contact.tpu_vote_addr.port(), contact.tpu_addr.port(),
+                    });
                     return null;
                 }
                 // Cache the result for future lookups
-                self.leader_tpu_cache.put(slot, contact.tpu_addr) catch {};
-                std.debug.print("[TpuClient] Found leader TPU for slot {d}: {d}.{d}.{d}.{d}:{d}\n", .{
+                self.leader_tpu_cache.put(slot, vote_addr) catch {};
+                std.debug.print("[TpuClient] Found leader TPU_VOTE for slot {d}: {d}.{d}.{d}.{d}:{d} (vote_port={d})\n", .{
                     slot,
-                    contact.tpu_addr.addr[0], contact.tpu_addr.addr[1],
-                    contact.tpu_addr.addr[2], contact.tpu_addr.addr[3],
-                    contact.tpu_addr.port(),
+                    vote_addr.addr[0], vote_addr.addr[1],
+                    vote_addr.addr[2], vote_addr.addr[3],
+                    vote_addr.port(),
+                    contact.tpu_vote_addr.port(),
                 });
-                return contact.tpu_addr;
+                return vote_addr;
+            } else {
+                // Leader not found in gossip table - log diagnostics
+                const contact_count = gs.table.contactCount();
+                std.debug.print("[TpuClient] Leader NOT FOUND in gossip! Looking for: {x:0>2}{x:0>2}{x:0>2}{x:0>2}... ({d} contacts)\n", .{
+                    leader_pubkey.data[0], leader_pubkey.data[1],
+                    leader_pubkey.data[2], leader_pubkey.data[3],
+                    contact_count,
+                });
+                // Log first few contacts for comparison (only occasionally to avoid spam)
+                const S = struct {
+                    var miss_count: u32 = 0;
+                };
+                S.miss_count += 1;
+                if (S.miss_count <= 5 or S.miss_count % 100 == 0) {
+                    var iter = gs.table.contacts.iterator();
+                    var i: usize = 0;
+                    while (iter.next()) |entry| {
+                        if (i < 3) {
+                            std.debug.print("[TpuClient]   Contact[{d}]: {x:0>2}{x:0>2}{x:0>2}{x:0>2}...\n", .{
+                                i,
+                                entry.key_ptr.data[0], entry.key_ptr.data[1],
+                                entry.key_ptr.data[2], entry.key_ptr.data[3],
+                            });
+                        }
+                        i += 1;
+                    }
+                }
             }
         }
 
@@ -166,9 +204,13 @@ pub const TpuClient = struct {
     /// Get leader pubkey for a slot from leader schedule
     fn getLeaderPubkey(self: *Self, slot: core.Slot) ?core.Pubkey {
         if (self.leader_schedule) |schedule| {
+            std.debug.print("[TpuClient] getLeaderPubkey: slot={d}, calling getSlotLeader\n", .{slot});
             if (schedule.getSlotLeader(slot)) |leader_bytes| {
                 return core.Pubkey{ .data = leader_bytes };
             }
+            std.debug.print("[TpuClient] getSlotLeader returned null\n", .{});
+        } else {
+            std.debug.print("[TpuClient] leader_schedule is NULL!\n", .{});
         }
         return null;
     }

@@ -212,14 +212,18 @@ pub const LeaderScheduleCache = struct {
         defer self.mutex.unlock();
 
         const epoch = self.generator.getEpoch(slot);
+        const count = self.schedules.count();
         if (self.schedules.get(epoch)) |schedule| {
+            std.debug.print("[LS] slot={d} epoch={d} count={d} first={d} last={d}\n", .{slot, epoch, count, schedule.first_slot, schedule.last_slot});
             return schedule.getLeader(slot);
         }
+        std.debug.print("[LS] NO SCHEDULE: slot={d} epoch={d} count={d}\n", .{slot, epoch, count});
         return null;
     }
 
     /// Add schedule for epoch
     pub fn addSchedule(self: *Self, schedule: EpochSchedule) !void {
+        std.debug.print("[LS] addSchedule: epoch={d} first={d} last={d} leaders_len={d}\n", .{schedule.epoch, schedule.first_slot, schedule.last_slot, schedule.slot_leaders.len});
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -318,6 +322,42 @@ pub const LeaderScheduleCache = struct {
         try self.parseLeaderScheduleResponse(response, slot orelse 0);
     }
     
+    /// Decode base58 pubkey to 32 bytes
+    fn decodeBase58Pubkey(b58: []const u8) ?Pubkey {
+        const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        
+        // Use a larger buffer to accumulate then extract last 32 bytes
+        var result: [64]u8 = [_]u8{0} ** 64;
+        var result_len: usize = 0;
+        
+        for (b58) |c| {
+            // Find digit value
+            const digit: u32 = blk: {
+                for (alphabet, 0..) |a, i| {
+                    if (a == c) break :blk @intCast(i);
+                }
+                return null; // Invalid character
+            };
+            
+            // Multiply result by 58 and add digit (big-endian)
+            var carry: u32 = digit;
+            var i: usize = 0;
+            while (i < result_len or carry > 0) : (i += 1) {
+                if (i >= 64) return null; // Overflow
+                const pos = 63 - i;
+                const val: u32 = @as(u32, result[pos]) * 58 + carry;
+                result[pos] = @truncate(val & 0xFF);
+                carry = val >> 8;
+            }
+            result_len = @max(result_len, i);
+        }
+        
+        // Extract last 32 bytes
+        var pubkey: [32]u8 = undefined;
+        @memcpy(&pubkey, result[32..64]);
+        return pubkey;
+    }
+    
     /// Parse leader schedule JSON response
     fn parseLeaderScheduleResponse(self: *Self, response: []const u8, base_slot: Slot) !void {
         // Find "result" in response
@@ -354,11 +394,11 @@ pub const LeaderScheduleCache = struct {
             const array_end = std.mem.indexOfPos(u8, content, array_start, "]") orelse break;
             const slots_str = content[array_start + 1 .. array_end];
             
-            // Parse pubkey (base58 decode simplified)
-            var pubkey: Pubkey = undefined;
-            @memset(&pubkey, 0);
-            const copy_len = @min(key.len, 32);
-            @memcpy(pubkey[0..copy_len], key[0..copy_len]);
+            // Parse pubkey (proper base58 decode)
+            const pubkey = decodeBase58Pubkey(key) orelse {
+                pos = array_end + 1;
+                continue;
+            };
             
             // Parse slots
             var slot_iter = std.mem.splitScalar(u8, slots_str, ',');
@@ -367,14 +407,21 @@ pub const LeaderScheduleCache = struct {
                 if (trimmed.len == 0) continue;
                 
                 const slot_num = std.fmt.parseInt(u64, trimmed, 10) catch continue;
-                if (slot_num >= first_slot and slot_num < first_slot + slots_per_epoch) {
-                    const idx = slot_num - first_slot;
-                    slot_leaders[idx] = pubkey;
+                // RPC returns indices (0-based within epoch), not absolute slots
+                if (slot_num < slots_per_epoch) {
+                    slot_leaders[slot_num] = pubkey;
                 }
             }
             
             pos = array_end + 1;
         }
+        
+        // Count non-zero leaders for debug
+        var non_zero: usize = 0;
+        for (slot_leaders) |leader| {
+            if (!std.mem.eql(u8, &leader, &[_]u8{0} ** 32)) non_zero += 1;
+        }
+        std.debug.print("[LeaderSchedule] Parsed {d} non-zero leaders for epoch {d}\n", .{non_zero, epoch});
         
         // Add to cache
         const schedule = EpochSchedule{
