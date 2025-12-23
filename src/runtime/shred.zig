@@ -506,6 +506,22 @@ pub const ShredAssembler = struct {
         errdefer missing.deinit();
         
         var i: u32 = 0;
+
+    /// Get all data shreds for a slot (for replay)
+    pub fn getShredsForSlot(self: *Self, slot: core.Slot) ![]Shred {
+        const slot_shreds = self.slots.get(slot) orelse return &[_]Shred{};
+        
+        var shreds = std.ArrayList(Shred).init(self.allocator);
+        errdefer shreds.deinit();
+        
+        // Collect all data shreds
+        var it = slot_shreds.data_shreds.valueIterator();
+        while (it.next()) |shred| {
+            try shreds.append(shred.*);
+        }
+        
+        return try shreds.toOwnedSlice();
+    }
         while (i <= slot_shreds.highest_data_index) : (i += 1) {
             if (slot_shreds.data_shreds.get(i) == null) {
                 try missing.append(i);

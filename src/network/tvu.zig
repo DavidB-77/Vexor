@@ -331,10 +331,7 @@ pub const TvuService = struct {
 
     /// Get shreds for a specific slot
     pub fn getShredsForSlot(self: *Self, slot: core.Slot) ![]runtime.Shred {
-        _ = self;
-        _ = slot;
-        // TODO: Implement when ShredAssembler has getShredsForSlot
-        return &[_]runtime.Shred{};
+        return try self.shred_assembler.getShredsForSlot(slot);
     }
 
     /// Process incoming shred packets (call in main loop)
