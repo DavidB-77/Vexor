@@ -1,0 +1,14 @@
+.{ 
+    .name = "vexor",
+    .version = "0.1.0",
+    .dependencies = .{
+        .@"rocksdb-zig" = .{
+            .path = "external/rocksdb-zig",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

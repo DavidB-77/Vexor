@@ -1,0 +1,12 @@
+[submodule "external/rocksdb-zig"]
+	path = external/rocksdb-zig
+	url = https://github.com/Syndica/rocksdb-zig
+[submodule "external/speedb"]
+	path = external/speedb
+	url = https://github.com/speedb-io/speedb
+[submodule "external/snappy"]
+	path = external/snappy
+	url = https://github.com/google/snappy
+[submodule "external/rocksdb"]
+	path = external/rocksdb
+	url = https://github.com/Syndica/rocksdb

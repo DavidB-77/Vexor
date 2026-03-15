@@ -1,0 +1,61 @@
+# Build artifacts
+.zig-cache/
+zig-out/
+*.o
+*.a
+*.so
+
+# External dependencies (fetched by build system)
+external/
+
+# Credentials & keys
+.credentials
+*.pem
+keypairs/
+
+# IDE & editor
+.cursor/
+.cursorignore
+.cursorrules
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# AI agent files
+.agent/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (dashboard)
+node_modules/
+.next/
+.env*.local
+
+# Logs
+*.log
+
+# Internal docs (not for public)
+docs-internal/
+
+# Downloaded binaries & archives
+*.tar.gz
+*.tar.gz:Zone.Identifier
+agave-install-init-*
+*:Zone.Identifier
+
+# Build output dumps
+build_output.txt
+
+# Backup files
+*.backup
+*.backup.*
+*.old
+
+# Rust build artifacts (tools/)
+tools/*/target/
+
+# Test fixtures (binary)
+test-fixtures/

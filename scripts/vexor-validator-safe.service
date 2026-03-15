@@ -1,0 +1,27 @@
+[Unit]
+Description=Vexor Validator (Safe Mode)
+After=network.target
+# SAFETY: Limit restart attempts to prevent kernel lockup loops
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Environment=VEXSTORE_PRIMARY_ENABLE=1
+Type=simple
+# SAFETY: Use on-failure instead of always - allows clean shutdown
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=1000000
+LogRateLimitIntervalSec=0
+Environment="PATH=/bin:/usr/bin:/usr/local/bin:/home/sol/vexor/bin"
+Environment="SOLANA_METRICS_CONFIG=host=https://metrics.solana.com:8086,db=tds,u=testnet_write,p=c4fa841aa918bf8274e3e2a44d77568d9861b3ea"
+# Use safe launcher with crash protection
+ExecStart=/home/sol/bin/vexor-safe-launch run
+ExecStop=/bin/kill -SIGTERM $MAINPID
+TimeoutSec=120
+User=sol
+Group=sol
+WorkingDirectory=/home/sol
+
+[Install]
+WantedBy=multi-user.target

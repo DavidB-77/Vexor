@@ -1,0 +1,584 @@
+//! Vexor Leader Schedule
+//!
+//! Calculates and caches the leader schedule for each epoch.
+//! The schedule is deterministically derived from stake weights.
+//!
+//! Schedule determination:
+//! 1. Get stake weights at epoch boundary
+//! 2. Shuffle validators using epoch-seeded RNG
+//! 3. Assign slots proportionally to stake
+
+const std = @import("std");
+const core = @import("../core/root.zig");
+const Allocator = std.mem.Allocator;
+const Mutex = std.Thread.Mutex;
+const Pubkey = core.Pubkey;
+const Slot = core.Slot;
+const Epoch = core.Epoch;
+
+/// Stake weight entry
+pub const StakeWeight = struct {
+    pubkey: Pubkey,
+    stake: u64,
+};
+
+/// Leader schedule for an epoch
+pub const EpochSchedule = struct {
+    epoch: Epoch,
+    first_slot: Slot,
+    last_slot: Slot,
+    slot_leaders: []Pubkey,
+
+    pub fn deinit(self: *EpochSchedule, allocator: Allocator) void {
+        allocator.free(self.slot_leaders);
+    }
+
+    /// Get leader for a slot
+    pub fn getLeader(self: *const EpochSchedule, slot: Slot) ?Pubkey {
+        if (slot < self.first_slot or slot > self.last_slot) return null;
+        const idx = slot - self.first_slot;
+        if (idx >= self.slot_leaders.len) return null;
+        return self.slot_leaders[idx];
+    }
+
+    /// Check if pubkey is leader for slot
+    pub fn isLeader(self: *const EpochSchedule, slot: Slot, pubkey: Pubkey) bool {
+        if (self.getLeader(slot)) |leader| {
+            return std.mem.eql(u8, &leader.data, &pubkey.data);
+        }
+        return false;
+    }
+
+    /// Get slots where pubkey is leader
+    pub fn getLeaderSlots(self: *const EpochSchedule, pubkey: Pubkey, allocator: Allocator) ![]Slot {
+        var slots = std.ArrayList(Slot).init(allocator);
+
+        for (self.slot_leaders, 0..) |leader, idx| {
+            if (std.mem.eql(u8, &leader.data, &pubkey.data)) {
+                try slots.append(self.first_slot + idx);
+            }
+        }
+
+        return slots.toOwnedSlice();
+    }
+};
+
+/// Leader schedule generator
+pub const LeaderScheduleGenerator = struct {
+    allocator: Allocator,
+    slots_per_epoch: u64,
+    leader_schedule_slot_offset: u64,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .allocator = allocator,
+            .slots_per_epoch = 432000, // ~2 days at 400ms/slot
+            .leader_schedule_slot_offset = 432000,
+        };
+    }
+
+    /// Generate leader schedule for an epoch
+    pub fn generate(self: *Self, epoch: Epoch, stakes: []const StakeWeight) !EpochSchedule {
+        const first_slot = epoch * self.slots_per_epoch;
+        const last_slot = first_slot + self.slots_per_epoch - 1;
+
+        // Calculate total stake
+        var total_stake: u64 = 0;
+        for (stakes) |sw| {
+            total_stake += sw.stake;
+        }
+
+        if (total_stake == 0) {
+            return error.NoStake;
+        }
+
+        // Allocate slot leaders
+        const slot_leaders = try self.allocator.alloc(Pubkey, self.slots_per_epoch);
+        errdefer self.allocator.free(slot_leaders);
+
+        // Seed RNG with epoch
+        var seed: [32]u8 = undefined;
+        std.mem.writeInt(u64, seed[0..8], epoch, .little);
+        @memset(seed[8..], 0);
+        var rng = std.rand.DefaultPrng.init(@bitCast(seed[0..8].*));
+
+        // Assign leaders proportionally to stake
+        var current_slot: usize = 0;
+        var remaining_slots = self.slots_per_epoch;
+
+        // Shuffle stake weights
+        const shuffled = try self.allocator.alloc(StakeWeight, stakes.len);
+        defer self.allocator.free(shuffled);
+        @memcpy(shuffled, stakes);
+
+        rng.random().shuffle(StakeWeight, shuffled);
+
+        // Assign slots
+        for (shuffled) |sw| {
+            if (remaining_slots == 0) break;
+
+            // Calculate slots for this validator (proportional to stake)
+            const validator_slots = @min(
+                (sw.stake * self.slots_per_epoch) / total_stake + 1,
+                remaining_slots,
+            );
+
+            // Assign consecutive slots
+            for (0..validator_slots) |_| {
+                if (current_slot >= slot_leaders.len) break;
+                slot_leaders[current_slot] = sw.pubkey;
+                current_slot += 1;
+                remaining_slots -= 1;
+            }
+        }
+
+        // Fill any remaining slots with random validators
+        while (current_slot < slot_leaders.len) {
+            const idx = rng.random().uintLessThan(usize, stakes.len);
+            slot_leaders[current_slot] = stakes[idx].pubkey;
+            current_slot += 1;
+        }
+
+        return EpochSchedule{
+            .epoch = epoch,
+            .first_slot = first_slot,
+            .last_slot = last_slot,
+            .slot_leaders = slot_leaders,
+        };
+    }
+
+    /// Get epoch for slot
+    pub fn getEpoch(self: *const Self, slot: Slot) Epoch {
+        return slot / self.slots_per_epoch;
+    }
+
+    /// Get first slot of epoch
+    pub fn getFirstSlotInEpoch(self: *const Self, epoch: Epoch) Slot {
+        return epoch * self.slots_per_epoch;
+    }
+
+    /// Get last slot of epoch
+    pub fn getLastSlotInEpoch(self: *const Self, epoch: Epoch) Slot {
+        return self.getFirstSlotInEpoch(epoch + 1) - 1;
+    }
+};
+
+/// Leader schedule cache
+pub const LeaderScheduleCache = struct {
+    allocator: Allocator,
+    schedules: std.AutoHashMap(Epoch, EpochSchedule),
+    mutex: Mutex,
+    generator: LeaderScheduleGenerator,
+
+    /// Our identity (for checking if we're leader)
+    identity: ?Pubkey = null,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .allocator = allocator,
+            .schedules = std.AutoHashMap(Epoch, EpochSchedule).init(allocator),
+            .mutex = .{},
+            .generator = LeaderScheduleGenerator.init(allocator),
+            .identity = null,
+        };
+    }
+
+    /// Set our identity for leader checks
+    pub fn setIdentity(self: *Self, identity: Pubkey) void {
+        self.identity = identity;
+    }
+
+    pub fn deinit(self: *Self) void {
+        var iter = self.schedules.valueIterator();
+        while (iter.next()) |schedule| {
+            var s = schedule.*;
+            s.deinit(self.allocator);
+        }
+        self.schedules.deinit();
+    }
+
+    /// Get leader for slot
+    pub fn getSlotLeader(self: *Self, slot: Slot) ?Pubkey {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const epoch = self.generator.getEpoch(slot);
+        const count = self.schedules.count();
+        if (self.schedules.get(epoch)) |schedule| {
+            std.debug.print("[LS] slot={d} epoch={d} count={d} first={d} last={d}\n", .{ slot, epoch, count, schedule.first_slot, schedule.last_slot });
+            return schedule.getLeader(slot);
+        }
+        std.debug.print("[LS] NO SCHEDULE: slot={d} epoch={d} count={d}\n", .{ slot, epoch, count });
+        return null;
+    }
+
+    /// Add schedule for epoch
+    pub fn addSchedule(self: *Self, schedule: EpochSchedule) !void {
+        std.debug.print("[LS] addSchedule: epoch={d} first={d} last={d} leaders_len={d}\n", .{ schedule.epoch, schedule.first_slot, schedule.last_slot, schedule.slot_leaders.len });
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Remove old schedule if exists
+        if (self.schedules.fetchRemove(schedule.epoch)) |removed| {
+            var s = removed.value;
+            s.deinit(self.allocator);
+        }
+
+        try self.schedules.put(schedule.epoch, schedule);
+    }
+
+    /// Generate and cache schedule
+    pub fn ensureSchedule(self: *Self, epoch: Epoch, stakes: []const StakeWeight) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.schedules.contains(epoch)) return;
+
+        const schedule = try self.generator.generate(epoch, stakes);
+        try self.schedules.put(epoch, schedule);
+    }
+
+    /// Check if we're leader for slot
+    pub fn isLeader(self: *Self, slot: Slot, pubkey: Pubkey) bool {
+        if (self.getSlotLeader(slot)) |leader| {
+            return std.mem.eql(u8, &leader.data, &pubkey.data);
+        }
+        return false;
+    }
+
+    /// Get next leader slot for pubkey (checks current + next epoch)
+    pub fn nextLeaderSlot(self: *Self, pubkey: Pubkey, start_slot: Slot) ?Slot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const epoch = self.generator.getEpoch(start_slot);
+
+        // Check current epoch
+        if (self.schedules.get(epoch)) |schedule| {
+            for (schedule.slot_leaders, 0..) |leader, idx| {
+                const slot = schedule.first_slot + idx;
+                if (slot >= start_slot and std.mem.eql(u8, &leader.data, &pubkey.data)) {
+                    return slot;
+                }
+            }
+        }
+
+        // Check next epoch (critical for epoch boundary transitions)
+        if (self.schedules.get(epoch + 1)) |schedule| {
+            for (schedule.slot_leaders, 0..) |leader, idx| {
+                const slot = schedule.first_slot + idx;
+                if (std.mem.eql(u8, &leader.data, &pubkey.data)) {
+                    return slot;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// Check if we're leader for the given slot
+    pub fn amILeader(self: *Self, slot: Slot) bool {
+        if (self.identity) |id| {
+            return self.isLeader(slot, id);
+        }
+        return false;
+    }
+
+    /// Fetch leader schedule from RPC endpoint
+    /// Reference: Sig transaction_sender/leader_info.zig getLeaderSchedule()
+    /// NOTE: Using curl subprocess because Zig std.http.Client doesn't properly send Content-Type header
+    pub fn fetchFromRpc(self: *Self, rpc_url: []const u8, slot: ?Slot) !void {
+        std.debug.print("[LeaderSchedule] Fetching from RPC: {s} for slot {?d}\n", .{ rpc_url, slot });
+
+        // Build JSON-RPC request body
+        var request_body = std.ArrayList(u8).init(self.allocator);
+        defer request_body.deinit();
+
+        const w = request_body.writer();
+        try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLeaderSchedule\"");
+        if (slot) |s| {
+            try w.print(",\"params\":[{d}]", .{s});
+        } else {
+            try w.writeAll(",\"params\":[]");
+        }
+        try w.writeAll("}");
+
+        // Build shell command string for curl
+        var curl_cmd = std.ArrayList(u8).init(self.allocator);
+        defer curl_cmd.deinit();
+        const cmd_w = curl_cmd.writer();
+        try cmd_w.print("/usr/bin/curl -s -X POST -H 'Content-Type: application/json' -d '{s}' {s}", .{ request_body.items, rpc_url });
+
+        std.debug.print("[LeaderSchedule] Curl command: {s}\n", .{curl_cmd.items});
+
+        // Use shell to execute curl command (bypasses subprocess argument handling issues)
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &[_][]const u8{
+                "/bin/sh",
+                "-c",
+                curl_cmd.items,
+            },
+            .max_output_bytes = 100 * 1024 * 1024, // Leader schedule can be several MB
+        }) catch |err| {
+            std.debug.print("[LeaderSchedule] curl failed: {}\n", .{err});
+            return err;
+        };
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        const response = result.stdout;
+        std.debug.print("[LeaderSchedule] Response length: {d} bytes\n", .{response.len});
+        if (response.len < 500) {
+            std.debug.print("[LeaderSchedule] Response: {s}\n", .{response});
+        } else {
+            std.debug.print("[LeaderSchedule] Response (truncated): {s}...\n", .{response[0..500]});
+        }
+
+        // Check for RPC error or null result
+        if (std.mem.indexOf(u8, response, "\"error\"")) |_| {
+            std.debug.print("[LeaderSchedule] RPC returned error!\n", .{});
+            return error.RpcError;
+        }
+
+        if (std.mem.indexOf(u8, response, "\"result\":null")) |_| {
+            std.log.info("[LeaderSchedule] RPC returned null result for slot {?d} (schedule not available yet)", .{slot});
+            return error.RpcError;
+        }
+
+        // When slot is null, getLeaderSchedule returns current epoch's schedule.
+        // We need to know the current slot to compute the correct epoch.
+        var effective_slot = slot orelse blk: {
+            // Fetch current slot from RPC to determine the right epoch
+            var getslot_cmd = std.ArrayList(u8).init(self.allocator);
+            defer getslot_cmd.deinit();
+            const gs_w = getslot_cmd.writer();
+            try gs_w.print("/usr/bin/curl -s -X POST -H 'Content-Type: application/json' -d '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSlot\"}}' {s}", .{rpc_url});
+
+            const gs_result = std.process.Child.run(.{
+                .allocator = self.allocator,
+                .argv = &[_][]const u8{ "/bin/sh", "-c", getslot_cmd.items },
+                .max_output_bytes = 1024,
+            }) catch break :blk @as(u64, 0);
+            defer self.allocator.free(gs_result.stdout);
+            defer self.allocator.free(gs_result.stderr);
+
+            // Parse "result":NNNNNN
+            if (std.mem.indexOf(u8, gs_result.stdout, "\"result\":")) |idx| {
+                const num_start = idx + 9;
+                var end = num_start;
+                while (end < gs_result.stdout.len and gs_result.stdout[end] >= '0' and gs_result.stdout[end] <= '9') : (end += 1) {}
+                if (end > num_start) {
+                    const current_slot = std.fmt.parseInt(u64, gs_result.stdout[num_start..end], 10) catch break :blk @as(u64, 0);
+                    std.debug.print("[LeaderSchedule] Current slot from RPC: {d} (epoch: {d})\n", .{ current_slot, current_slot / self.generator.slots_per_epoch });
+                    break :blk current_slot;
+                }
+            }
+            break :blk @as(u64, 0);
+        };
+        _ = &effective_slot;
+
+        // Parse leader schedule from response
+        self.parseLeaderScheduleResponse(response, effective_slot) catch |err| {
+            std.debug.print("[LeaderSchedule] Parse error: {}\n", .{err});
+            return err;
+        };
+
+        std.debug.print("[LeaderSchedule] Successfully loaded leader schedule\n", .{});
+    }
+
+    /// Decode base58 pubkey to 32 bytes
+    fn decodeBase58Pubkey(b58: []const u8) ?Pubkey {
+        const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+        // Use a larger buffer to accumulate then extract last 32 bytes
+        var result: [64]u8 = [_]u8{0} ** 64;
+        var result_len: usize = 0;
+
+        for (b58) |c| {
+            // Find digit value
+            const digit: u32 = blk: {
+                for (alphabet, 0..) |a, i| {
+                    if (a == c) break :blk @intCast(i);
+                }
+                return null; // Invalid character
+            };
+
+            // Multiply result by 58 and add digit (big-endian)
+            var carry: u32 = digit;
+            var i: usize = 0;
+            while (i < result_len or carry > 0) : (i += 1) {
+                if (i >= 64) return null; // Overflow
+                const pos = 63 - i;
+                const val: u32 = @as(u32, result[pos]) * 58 + carry;
+                result[pos] = @truncate(val & 0xFF);
+                carry = val >> 8;
+            }
+            result_len = @max(result_len, i);
+        }
+
+        // Extract last 32 bytes
+        var pubkey_data: [32]u8 = undefined;
+        @memcpy(&pubkey_data, result[32..64]);
+        return Pubkey.fromBytes(pubkey_data);
+    }
+
+    /// Parse leader schedule JSON response
+    fn parseLeaderScheduleResponse(self: *Self, response: []const u8, base_slot: Slot) !void {
+        // Find "result" in response
+        const result_start = std.mem.indexOf(u8, response, "\"result\"") orelse return error.InvalidResponse;
+        const content = response[result_start..];
+
+        // Parse each validator's slot assignments
+        // Format: {"validatorPubkey": [slot1, slot2, ...], ...}
+        const epoch = self.generator.getEpoch(base_slot);
+        const first_slot = self.generator.getFirstSlotInEpoch(epoch);
+        const slots_per_epoch = self.generator.slots_per_epoch;
+
+        // Allocate slot leaders array
+        var slot_leaders = try self.allocator.alloc(Pubkey, slots_per_epoch);
+        errdefer self.allocator.free(slot_leaders);
+        @memset(slot_leaders, Pubkey.fromBytes([_]u8{0} ** 32));
+
+        // Simple parsing: find pubkey:slots pairs
+        var pos: usize = 0;
+        while (pos < content.len) {
+            // Find next pubkey (44 char base58)
+            const quote_start = std.mem.indexOfPos(u8, content, pos, "\"") orelse break;
+            const quote_end = std.mem.indexOfPos(u8, content, quote_start + 1, "\"") orelse break;
+            const key = content[quote_start + 1 .. quote_end];
+
+            // Skip if not a pubkey (44 chars)
+            if (key.len < 32 or key.len > 44) {
+                pos = quote_end + 1;
+                continue;
+            }
+
+            // Find slot array
+            const array_start = std.mem.indexOfPos(u8, content, quote_end, "[") orelse break;
+            const array_end = std.mem.indexOfPos(u8, content, array_start, "]") orelse break;
+            const slots_str = content[array_start + 1 .. array_end];
+
+            // Parse pubkey (proper base58 decode)
+            const pubkey = decodeBase58Pubkey(key) orelse {
+                pos = array_end + 1;
+                continue;
+            };
+
+            // Parse slots
+            var slot_iter = std.mem.splitScalar(u8, slots_str, ',');
+            while (slot_iter.next()) |slot_str| {
+                const trimmed = std.mem.trim(u8, slot_str, " \t\n");
+                if (trimmed.len == 0) continue;
+
+                const slot_num = std.fmt.parseInt(u64, trimmed, 10) catch continue;
+                // RPC returns indices (0-based within epoch), not absolute slots
+                if (slot_num < slots_per_epoch) {
+                    slot_leaders[slot_num] = pubkey;
+                }
+            }
+
+            pos = array_end + 1;
+        }
+
+        // Count non-zero leaders for debug
+        var non_zero: usize = 0;
+        for (slot_leaders) |leader| {
+            if (!std.mem.eql(u8, &leader.data, &[_]u8{0} ** 32)) non_zero += 1;
+        }
+        std.debug.print("[LeaderSchedule] Parsed {d} non-zero leaders for epoch {d}\n", .{ non_zero, epoch });
+
+        // Add to cache
+        const schedule = EpochSchedule{
+            .epoch = epoch,
+            .first_slot = first_slot,
+            .last_slot = first_slot + slots_per_epoch - 1,
+            .slot_leaders = slot_leaders,
+        };
+
+        try self.addSchedule(schedule);
+        std.log.info("[LeaderSchedule] Loaded schedule for epoch {d}", .{epoch});
+    }
+
+    /// Import leader schedule directly (from gossip or snapshot)
+    pub fn importSchedule(self: *Self, epoch: Epoch, leaders: []const Pubkey) !void {
+        const slot_leaders = try self.allocator.alloc(Pubkey, leaders.len);
+        @memcpy(slot_leaders, leaders);
+
+        const schedule = EpochSchedule{
+            .epoch = epoch,
+            .first_slot = self.generator.getFirstSlotInEpoch(epoch),
+            .last_slot = self.generator.getLastSlotInEpoch(epoch),
+            .slot_leaders = slot_leaders,
+        };
+
+        try self.addSchedule(schedule);
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TESTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+test "leader schedule generator" {
+    const allocator = std.testing.allocator;
+
+    var generator = LeaderScheduleGenerator.init(allocator);
+    generator.slots_per_epoch = 100; // Small for testing
+
+    const pubkey1 = Pubkey.fromBytes([_]u8{0x11} ** 32);
+    const pubkey2 = Pubkey.fromBytes([_]u8{0x22} ** 32);
+
+    const stakes = [_]StakeWeight{
+        .{ .pubkey = pubkey1, .stake = 1000 },
+        .{ .pubkey = pubkey2, .stake = 1000 },
+    };
+
+    var schedule = try generator.generate(0, &stakes);
+    defer schedule.deinit(allocator);
+
+    try std.testing.expectEqual(@as(Epoch, 0), schedule.epoch);
+    try std.testing.expectEqual(@as(Slot, 0), schedule.first_slot);
+    try std.testing.expectEqual(@as(Slot, 99), schedule.last_slot);
+
+    // Every slot should have a leader
+    for (schedule.slot_leaders) |leader| {
+        try std.testing.expect(std.mem.eql(u8, &leader.data, &pubkey1.data) or std.mem.eql(u8, &leader.data, &pubkey2.data));
+    }
+}
+
+test "leader schedule cache" {
+    const allocator = std.testing.allocator;
+
+    var cache = LeaderScheduleCache.init(allocator);
+    defer cache.deinit();
+
+    cache.generator.slots_per_epoch = 100;
+
+    const pubkey1 = Pubkey.fromBytes([_]u8{0x11} ** 32);
+
+    const stakes = [_]StakeWeight{
+        .{ .pubkey = pubkey1, .stake = 1000 },
+    };
+
+    try cache.ensureSchedule(0, &stakes);
+
+    // Should be able to get leader
+    const leader = cache.getSlotLeader(50);
+    try std.testing.expect(leader != null);
+}
+
+test "epoch calculation" {
+    const allocator = std.testing.allocator;
+
+    const generator = LeaderScheduleGenerator.init(allocator);
+
+    try std.testing.expectEqual(@as(Epoch, 0), generator.getEpoch(0));
+    try std.testing.expectEqual(@as(Epoch, 0), generator.getEpoch(431999));
+    try std.testing.expectEqual(@as(Epoch, 1), generator.getEpoch(432000));
+    try std.testing.expectEqual(@as(Epoch, 1), generator.getEpoch(500000));
+}
